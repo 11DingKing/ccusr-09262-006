@@ -31,8 +31,24 @@ class ExportService:
                     f"报告状态为 {report.status.value}，仅复核通过后可导出"
                 )
 
+            # 已签发报告以当前修订版本为导出内容；旧版本通过历史接口读取
+            current_no = report.current_revision_no or 1
+            snap = store.get_revision_history(report_id, current_no)
+            if snap is None:
+                raise StateError(
+                    f"导出失败：签发版本 v{current_no} 历史缺失"
+                )
+            signed_lines = snap["lines"]
+            revision_chain = [
+                {"revision_no": h["revision_no"],
+                 "change_reason": h["change_reason"],
+                 "result_fingerprint": h["result_fingerprint"],
+                 "created_at": h["created_at"]}
+                for h in store.list_revision_history(report_id)
+            ]
+
             evidence_ids = sorted({
-                eid for line in report.lines for eid in line.get("evidence_ids", [])
+                eid for line in signed_lines for eid in line.get("evidence_ids", [])
             })
             evidence = [
                 {
@@ -66,7 +82,9 @@ class ExportService:
                 "target_caliber": report.target_caliber,
                 "data_version_no": report.data_version_no,
                 "pins": report.pins,
-                "lines": report.lines,
+                "lines": signed_lines,
+                "current_revision_no": current_no,
+                "revision_history": revision_chain,
                 "conversion_basis": rules_basis,
                 "evidence": evidence,
                 "status": report.status.value,

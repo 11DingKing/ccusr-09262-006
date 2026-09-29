@@ -121,7 +121,35 @@ CREATE TABLE IF NOT EXISTS reports (
     status TEXT NOT NULL,
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    task_id TEXT NOT NULL UNIQUE
+    task_id TEXT NOT NULL UNIQUE,
+    current_revision_no INTEGER
+);
+CREATE TABLE IF NOT EXISTS report_revisions (
+    id TEXT PRIMARY KEY,
+    report_id TEXT NOT NULL REFERENCES reports(id),
+    base_revision_no INTEGER NOT NULL,
+    new_revision_no INTEGER,
+    lines_json TEXT NOT NULL,
+    correction_reason TEXT NOT NULL,
+    status TEXT NOT NULL,
+    requested_by TEXT NOT NULL,
+    requested_at TEXT NOT NULL,
+    decided_by TEXT,
+    decided_at TEXT,
+    decision_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_report_revisions_report
+    ON report_revisions (report_id, status);
+CREATE TABLE IF NOT EXISTS report_revision_history (
+    report_id TEXT NOT NULL REFERENCES reports(id),
+    revision_no INTEGER NOT NULL,
+    lines_json TEXT NOT NULL,
+    result_fingerprint TEXT NOT NULL,
+    change_reason TEXT,
+    source_revision_id TEXT,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (report_id, revision_no)
 );
 CREATE TABLE IF NOT EXISTS report_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -159,7 +187,43 @@ def connect(path: str) -> sqlite3.Connection:
     if path != ":memory:":
         conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA)
+    _migrate_report_revisions(conn)
     return conn
+
+
+def _migrate_report_revisions(conn: sqlite3.Connection) -> None:
+    """为旧库补 current_revision_no 列，并把已签发报告登记为修订 v1。
+
+    修订功能上线前已存在的 reviewed 报告同样需要可被更正，且其首次
+    签发内容必须留在历史中，保证旧版读取不丢历史。
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(reports)")}
+    if "current_revision_no" not in cols:
+        conn.execute(
+            "ALTER TABLE reports ADD COLUMN current_revision_no INTEGER"
+        )
+    existing = {(r["report_id"], r["revision_no"]) for r in conn.execute(
+        "SELECT report_id, revision_no FROM report_revision_history"
+    )}
+    rows = conn.execute(
+        "SELECT id, lines_json, result_fingerprint, created_by, created_at"
+        " FROM reports WHERE status = 'reviewed'"
+    ).fetchall()
+    for r in rows:
+        if (r["id"], 1) in existing:
+            continue
+        conn.execute(
+            "INSERT INTO report_revision_history"
+            " (report_id, revision_no, lines_json, result_fingerprint,"
+            " change_reason, source_revision_id, created_by, created_at)"
+            " VALUES (?, 1, ?, ?, '首次签发', NULL, ?, ?)",
+            (r["id"], r["lines_json"], r["result_fingerprint"],
+             r["created_by"], r["created_at"]),
+        )
+    conn.execute(
+        "UPDATE reports SET current_revision_no = 1"
+        " WHERE status = 'reviewed' AND current_revision_no IS NULL"
+    )
 
 
 class UnitOfWork(AbstractContextManager):

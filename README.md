@@ -18,6 +18,12 @@
   输入指纹与结果指纹（规范化 JSON 的 SHA-256）。复算严格按固化版本取数。
 - **授权粒度**：机构仅能访问被授权的 `项目 × 指标类别 × 权限`；
   主管单位（`X-Role: supervisor`）拥有全部范围。
+- **已签报告修订**：复核通过即首次签发（修订 v1）。更正绝不原地改写，
+  只生成新修订（v2、v3…）；申请与审批均做 Python 层版本校验
+  （`expected_version` 乐观锁），版本过期返回明确 409 冲突（含
+  `expected/current`）。每个签发版本的完整行快照与更正理由保留在
+  SQLite 签发历史中，读者可同时读取旧签发内容与更正理由；审批人不得是
+  更正申请人。旧库连接时自动把已签发报告补登为 v1。
 - **幂等与断点恢复**：计算任务以幂等键去重；计算分
   `snapshot → convert → aggregate → persist` 四步，每步落检查点，
   失败/崩溃后再次执行从断点续跑，重复执行收敛为同一份报告。
@@ -58,6 +64,10 @@
 | `GET  /reports/{report_id}` | 报告详情（pins、指纹、事件、证据引用） |
 | `POST /reports/{report_id}/reverify` | 按固化版本复算并核对指纹 |
 | `POST /reports/{report_id}/review` | 复核通过/驳回（复核人不得是原计算人） |
+| `POST /reports/{report_id}/revisions` | 已签报告更正申请（带 `expected_version` 乐观锁） |
+| `POST /revisions/{revision_id}/decision` | 更正审批（审批人不得是申请人） |
+| `GET  /reports/{report_id}/revisions` | 更正申请列表 |
+| `GET  /reports/{report_id}/history` / `.../history/{ver}` | 签发历史 / 指定旧版本（含更正理由） |
 | `POST /reports/{report_id}/exports` | 导出复核通过的报告（含换算依据与证据清单） |
 | `POST /grants` | 主管单位配置机构授权 |
 
@@ -84,6 +94,8 @@ python3 -m unittest discover -s tests -v
 迟到数据新版本与差异、撤回记录、并发会签恰好生效一次、
 幂等提交与并发收敛、断点恢复与失败标记、指标更新不可改写旧报告、
 规则回滚仅影响新报告、授权粒度过滤、复核独立性与导出留痕、HTTP 全链路。
+修订场景另覆盖：旧签发版本按号读取与新旧内容/理由并列、过期版本申请与
+迟到申请审批的 409 冲突响应、驳回不产生新版本、旧库迁移补登 v1。
 
 ## 编译检查
 

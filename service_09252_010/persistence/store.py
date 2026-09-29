@@ -13,7 +13,9 @@ from ..domain.models import (
     IndicatorVersion,
     Observation,
     Report,
+    ReportRevision,
     ReportStatus,
+    RevisionStatus,
     RuleStatus,
     TaskStatus,
     ComputationTask,
@@ -358,13 +360,15 @@ class Store:
             "INSERT INTO reports (id, project_id, window_start, window_end,"
             " target_caliber, data_version_no, pins_json, lines_json,"
             " input_fingerprint, result_fingerprint, status, created_by,"
-            " created_at, task_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " created_at, task_id, current_revision_no) VALUES"
+            " (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (report.id, report.project_id, report.window_start, report.window_end,
              report.target_caliber, report.data_version_no,
              json.dumps(report.pins, sort_keys=True),
              json.dumps(report.lines, sort_keys=True),
              report.input_fingerprint, report.result_fingerprint,
-             report.status.value, report.created_by, report.created_at, report.task_id),
+             report.status.value, report.created_by, report.created_at, report.task_id,
+             report.current_revision_no),
         )
 
     def get_report(self, report_id: str) -> Report | None:
@@ -386,6 +390,137 @@ class Store:
             (status.value, report_id),
         )
 
+    def mark_report_issued(self, report_id: str, at: str) -> None:
+        """复核通过即首次签发：写入修订 v1 历史并置当前版本指针。"""
+        row = self.conn.execute(
+            "SELECT lines_json, result_fingerprint, created_by FROM reports"
+            " WHERE id = ?",
+            (report_id,),
+        ).fetchone()
+        assert row is not None
+        self.conn.execute(
+            "INSERT INTO report_revision_history"
+            " (report_id, revision_no, lines_json, result_fingerprint,"
+            " change_reason, source_revision_id, created_by, created_at)"
+            " VALUES (?, 1, ?, ?, '首次签发', NULL, ?, ?)",
+            (report_id, row["lines_json"], row["result_fingerprint"],
+             row["created_by"], at),
+        )
+        self.conn.execute(
+            "UPDATE reports SET status = ?, current_revision_no = 1 WHERE id = ?",
+            (ReportStatus.REVIEWED.value, report_id),
+        )
+
+    # ---- 已签报告修订 ----
+    def add_report_revision(self, rev: ReportRevision) -> None:
+        self.conn.execute(
+            "INSERT INTO report_revisions (id, report_id, base_revision_no,"
+            " new_revision_no, lines_json, correction_reason, status,"
+            " requested_by, requested_at, decided_by, decided_at,"
+            " decision_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (rev.id, rev.report_id, rev.base_revision_no, rev.new_revision_no,
+             json.dumps(rev.lines, sort_keys=True), rev.correction_reason,
+             rev.status.value, rev.requested_by, rev.requested_at,
+             rev.decided_by, rev.decided_at, rev.decision_reason),
+        )
+
+    def get_report_revision(self, revision_id: str) -> ReportRevision | None:
+        row = self.conn.execute(
+            "SELECT * FROM report_revisions WHERE id = ?", (revision_id,)
+        ).fetchone()
+        return self._to_report_revision(row) if row else None
+
+    def list_report_revisions(self, report_id: str) -> list[ReportRevision]:
+        rows = self.conn.execute(
+            "SELECT * FROM report_revisions WHERE report_id = ?"
+            " ORDER BY requested_at, id",
+            (report_id,),
+        ).fetchall()
+        return [self._to_report_revision(r) for r in rows]
+
+    def pending_report_revision(self, report_id: str) -> ReportRevision | None:
+        row = self.conn.execute(
+            "SELECT * FROM report_revisions WHERE report_id = ?"
+            " AND status = 'pending' ORDER BY requested_at, id LIMIT 1",
+            (report_id,),
+        ).fetchone()
+        return self._to_report_revision(row) if row else None
+
+    def set_revision_decision(self, rev: ReportRevision) -> None:
+        self.conn.execute(
+            "UPDATE report_revisions SET status = ?, new_revision_no = ?,"
+            " decided_by = ?, decided_at = ?, decision_reason = ? WHERE id = ?",
+            (rev.status.value, rev.new_revision_no, rev.decided_by,
+             rev.decided_at, rev.decision_reason, rev.id),
+        )
+
+    @staticmethod
+    def _to_report_revision(row: sqlite3.Row) -> ReportRevision:
+        return ReportRevision(
+            id=row["id"],
+            report_id=row["report_id"],
+            base_revision_no=row["base_revision_no"],
+            lines=json.loads(row["lines_json"]),
+            correction_reason=row["correction_reason"],
+            status=RevisionStatus(row["status"]),
+            requested_by=row["requested_by"],
+            requested_at=row["requested_at"],
+            new_revision_no=row["new_revision_no"],
+            decided_by=row["decided_by"],
+            decided_at=row["decided_at"],
+            decision_reason=row["decision_reason"],
+        )
+
+    def add_revision_history(self, report_id: str, revision_no: int,
+                             lines: list[dict], result_fingerprint: str,
+                             change_reason: str, source_revision_id: str,
+                             created_by: str, created_at: str) -> None:
+        """追加一个签发版本；(report_id, revision_no) 主键兜底并发。"""
+        self.conn.execute(
+            "INSERT INTO report_revision_history"
+            " (report_id, revision_no, lines_json, result_fingerprint,"
+            " change_reason, source_revision_id, created_by, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (report_id, revision_no, json.dumps(lines, sort_keys=True),
+             result_fingerprint, change_reason, source_revision_id,
+             created_by, created_at),
+        )
+
+    def get_revision_history(self, report_id: str,
+                             revision_no: int) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM report_revision_history"
+            " WHERE report_id = ? AND revision_no = ?",
+            (report_id, revision_no),
+        ).fetchone()
+        return self._to_revision_history(row) if row else None
+
+    def list_revision_history(self, report_id: str) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM report_revision_history"
+            " WHERE report_id = ? ORDER BY revision_no",
+            (report_id,),
+        ).fetchall()
+        return [self._to_revision_history(r) for r in rows]
+
+    @staticmethod
+    def _to_revision_history(row: sqlite3.Row) -> dict:
+        return {
+            "revision_no": row["revision_no"],
+            "lines": json.loads(row["lines_json"]),
+            "result_fingerprint": row["result_fingerprint"],
+            "change_reason": row["change_reason"],
+            "source_revision_id": row["source_revision_id"],
+            "created_by": row["created_by"],
+            "created_at": row["created_at"],
+        }
+
+    def set_current_revision_no(self, report_id: str, revision_no: int) -> None:
+        self.conn.execute(
+            "UPDATE reports SET current_revision_no = ? WHERE id = ?",
+            (revision_no, report_id),
+        )
+
     @staticmethod
     def _to_report(row: sqlite3.Row) -> Report:
         return Report(
@@ -403,6 +538,7 @@ class Store:
             created_by=row["created_by"],
             created_at=row["created_at"],
             task_id=row["task_id"],
+            current_revision_no=row["current_revision_no"],
         )
 
     def add_report_event(self, report_id: str, event: str, actor: str,

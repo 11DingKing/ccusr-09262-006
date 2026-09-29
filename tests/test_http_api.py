@@ -155,6 +155,87 @@ class HttpApiTests(unittest.TestCase):
         }, {"X-Institution-Id": "陌生机构"})
         self.assertEqual(status, 403)
 
+    def test_signed_report_revision_flow_and_conflict(self) -> None:
+        # 复用验收流造出一份已签发报告
+        status, body = call(self.app, "POST", "/indicators", {
+            "code": "enrollment_total", "name": "招生总数", "category": "招生",
+            "unit": "人", "formula": {"type": "sum",
+                                      "measure": "enrollment_count"},
+            "missing_policy": "skip",
+        }, SUP)
+        self.assertEqual(status, 201, body)
+        for permission in ("import", "calculate", "view", "export"):
+            call(self.app, "POST", "/grants", {
+                "institution_id": "机构A", "project_id": "P1",
+                "category": "*", "permission": permission,
+            }, SUP)
+        status, body = call(self.app, "POST", "/evidence", {
+            "project_id": "P1", "kind": "年报", "uri": "s3://ev/1.pdf",
+            "sha256": "b" * 64,
+        }, INST_A)
+        ev = body["evidence_id"]
+        call(self.app, "POST", "/projects/P1/imports", {
+            "reason": "首批", "records": [
+                {"measure": "enrollment_count", "period": "2024-01",
+                 "caliber": "CN-STD", "value": 100, "evidence_id": ev}],
+        }, INST_A)
+        status, body = call(self.app, "POST", "/tasks", {
+            "project_id": "P1", "window_start": "2024-01",
+            "window_end": "2024-01", "target_caliber": "CN-STD",
+            "idempotency_key": "rev-key",
+        }, INST_A)
+        task_id = body["task_id"]
+        status, body = call(self.app, "POST", f"/tasks/{task_id}/run",
+                            {}, INST_A)
+        report_id = body["report_id"]
+        call(self.app, "POST", f"/reports/{report_id}/review",
+             {"approve": True}, SUP)
+
+        # 签发历史 v1 可按版本读取
+        status, hist = call(self.app, "GET",
+                            f"/reports/{report_id}/history", headers=SUP)
+        self.assertEqual(status, 200)
+        self.assertEqual([v["revision_no"] for v in hist["versions"]], [1])
+        self.assertEqual(hist["versions"][0]["lines"][0]["value"], 100.0)
+
+        # 机构A 基于 v1 申请更正，主管单位批准，生成 v2
+        corrected = [{"code": "enrollment_total", "category": "招生",
+                      "name": "招生总数", "unit": "人", "version_no": 1,
+                      "value": 108.0, "covered_periods": ["2024-01"],
+                      "missing_periods": [], "notes": [],
+                      "evidence_ids": [ev]}]
+        status, req = call(self.app, "POST",
+                           f"/reports/{report_id}/revisions",
+                           {"expected_version": 1, "lines": corrected,
+                            "reason": "源数据录入错误"}, INST_A)
+        self.assertEqual(status, 201, req)
+        status, decision = call(
+            self.app, "POST",
+            f"/revisions/{req['revision_id']}/decision",
+            {"approve": True, "reason": "批准"}, SUP)
+        self.assertEqual(status, 200, decision)
+        self.assertEqual(decision["current_revision_no"], 2)
+
+        # 读者同时看到旧签发内容与更正理由
+        status, hist = call(self.app, "GET",
+                            f"/reports/{report_id}/history", headers=SUP)
+        self.assertEqual(hist["versions"][0]["lines"][0]["value"], 100.0)
+        self.assertEqual(hist["versions"][1]["lines"][0]["value"], 108.0)
+        self.assertEqual(hist["versions"][1]["change_reason"], "源数据录入错误")
+        status, old = call(self.app, "GET",
+                           f"/reports/{report_id}/history/1", headers=SUP)
+        self.assertEqual(status, 200)
+        self.assertEqual(old["version"]["lines"][0]["value"], 100.0)
+
+        # 再基于过期版本 v1 申请：明确 409 冲突响应
+        status, conflict = call(self.app, "POST",
+                                f"/reports/{report_id}/revisions",
+                                {"expected_version": 1, "lines": corrected,
+                                 "reason": "迟到更正"}, INST_A)
+        self.assertEqual(status, 409)
+        self.assertEqual(conflict["error"], "conflict")
+        self.assertEqual(conflict["detail"], {"expected": 1, "current": 2})
+
 
 if __name__ == "__main__":
     unittest.main()

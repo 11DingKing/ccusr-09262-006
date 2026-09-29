@@ -73,6 +73,16 @@ class Application:
             ("GET", ("tasks", "{task_id}"), self._get_task),
             ("GET", ("reports",), self._list_reports),
             ("POST", ("reports", "{report_id}", "review"), self._review_report),
+            ("POST", ("reports", "{report_id}", "revisions"),
+             self._request_revision),
+            ("GET", ("reports", "{report_id}", "revisions"),
+             self._list_revisions),
+            ("GET", ("reports", "{report_id}", "history"),
+             self._revision_history),
+            ("GET", ("reports", "{report_id}", "history", "{ver}"),
+             self._revision_history_version),
+            ("POST", ("revisions", "{revision_id}", "decision"),
+             self._decide_revision),
             ("POST", ("reports", "{report_id}", "reverify"), self._reverify),
             ("POST", ("reports", "{report_id}", "exports"), self._export_report),
             ("GET", ("reports", "{report_id}"), self._get_report),
@@ -262,6 +272,44 @@ class Application:
     def _review_report(self, p: Principal, body: dict, ctx: Context):
         return 200, ctx.container.review.review(
             p, ctx.match["report_id"], approve=bool(body["approve"]),
+            reason=body.get("reason", ""),
+        )
+
+    # ---- 已签报告修订 ----
+    def _request_revision(self, p: Principal, body: dict, ctx: Context):
+        from ..domain.errors import ValidationError
+
+        if "expected_version" not in body:
+            raise ValidationError(
+                "更正申请必须携带 expected_version（所基于的签发版本号）"
+            )
+        result = ctx.container.revisions.request_correction(
+            p, ctx.match["report_id"],
+            expected_version=int(body["expected_version"]),
+            lines=body["lines"], reason=body.get("reason", ""),
+        )
+        return 201, result
+
+    def _list_revisions(self, p: Principal, body: dict, ctx: Context):
+        return 200, ctx.container.revisions.list_requests(
+            p, ctx.match["report_id"]
+        )
+
+    def _revision_history(self, p: Principal, body: dict, ctx: Context):
+        return 200, ctx.container.revisions.history(
+            p, ctx.match["report_id"]
+        )
+
+    def _revision_history_version(self, p: Principal, body: dict, ctx: Context):
+        return 200, ctx.container.revisions.history(
+            p, ctx.match["report_id"], int(ctx.match["ver"])
+        )
+
+    def _decide_revision(self, p: Principal, body: dict, ctx: Context):
+        expected = body.get("expected_version")
+        return 200, ctx.container.revisions.decide(
+            p, ctx.match["revision_id"], approve=bool(body["approve"]),
+            expected_version=int(expected) if expected is not None else None,
             reason=body.get("reason", ""),
         )
 

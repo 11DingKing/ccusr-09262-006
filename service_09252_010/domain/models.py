@@ -37,8 +37,16 @@ class TaskStatus(str, Enum):
 
 class ReportStatus(str, Enum):
     COMPUTED = "computed"  # 已计算，待复核
-    REVIEWED = "reviewed"  # 复核通过，可导出
+    REVIEWED = "reviewed"  # 复核通过（已签发），可导出
     REJECTED = "rejected"  # 复核驳回（终态）
+
+
+class RevisionStatus(str, Enum):
+    """已签报告更正申请的生命周期。"""
+
+    PENDING = "pending"  # 更正申请待审批
+    APPROVED = "approved"  # 批准：生成新的签发版本
+    REJECTED = "rejected"  # 驳回：不产生新版本（终态）
 
 
 # 计算任务的断点步骤，顺序即执行顺序。
@@ -175,6 +183,30 @@ class Report:
     created_by: str
     created_at: str
     task_id: str
+    current_revision_no: int | None = None  # 已签发后的当前版本；首次签发为 1
+
+
+@dataclass(frozen=True)
+class ReportRevision:
+    """已签报告的一次更正申请。
+
+    更正绝不改写已签发内容：批准后仅把 current_revision_no 推进到新版本，
+    旧版本的完整行快照由 report_revision_history 保留，读者可同时看到
+    旧签发内容与本次更正理由。
+    """
+
+    id: str
+    report_id: str
+    base_revision_no: int  # 申请所基于的签发版本（Python 乐观锁校验）
+    lines: list[dict]
+    correction_reason: str
+    status: RevisionStatus
+    requested_by: str
+    requested_at: str
+    new_revision_no: int | None = None  # 批准后生成的新版本号
+    decided_by: str | None = None
+    decided_at: str | None = None
+    decision_reason: str | None = None
 
 
 @dataclass(frozen=True)

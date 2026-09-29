@@ -381,15 +381,18 @@ class CalculationService:
             if report is None:
                 raise NotFoundError(f"报告不存在: {report_id}")
             policy = AccessPolicy(store)
-            categories = sorted({line["category"] for line in report.lines})
+            # 已签发报告的“当前内容”以当前修订版本为准（旧版内容走历史接口）
+            current_lines, current_fp = self._signed_current(store, report)
+            categories = sorted({line["category"] for line in current_lines})
             visible = set(
                 policy.granted_categories(principal, report.project_id,
                                           "view", categories)
             )
             events = store.list_report_events(report_id)
-        visible_lines = [l for l in report.lines if l["category"] in visible]
+        visible_lines = [l for l in current_lines if l["category"] in visible]
         redacted = sorted(c for c in categories if c not in visible)
-        return self._report_dict(report, visible_lines, redacted, events)
+        return self._report_dict(report, visible_lines, redacted, events,
+                                 current_fp)
 
     def list_reports(self, principal: Principal, project_id: str) -> list[dict]:
         with self.db.read() as conn:
@@ -398,17 +401,33 @@ class CalculationService:
             policy = AccessPolicy(store)
             result = []
             for report in reports:
-                categories = sorted({l["category"] for l in report.lines})
+                current_lines, current_fp = self._signed_current(store, report)
+                categories = sorted({l["category"] for l in current_lines})
                 visible = set(policy.granted_categories(
                     principal, project_id, "view", categories))
-                lines = [l for l in report.lines if l["category"] in visible]
+                lines = [l for l in current_lines if l["category"] in visible]
                 redacted = sorted(c for c in categories if c not in visible)
-                result.append(self._report_dict(report, lines, redacted, []))
+                result.append(self._report_dict(report, lines, redacted, [],
+                                                current_fp))
         return result
 
     @staticmethod
+    def _signed_current(store: Store,
+                        report: Report) -> tuple[list[dict], str | None]:
+        """已签发报告返回当前修订版本的行与指纹；未签发返回原始计算内容。"""
+        if report.status is ReportStatus.REVIEWED \
+                and report.current_revision_no is not None:
+            snap = store.get_revision_history(
+                report.id, report.current_revision_no
+            )
+            if snap is not None:
+                return snap["lines"], snap["result_fingerprint"]
+        return report.lines, None
+
+    @staticmethod
     def _report_dict(report: Report, lines: list[dict], redacted: list[str],
-                     events: list[dict]) -> dict:
+                     events: list[dict],
+                     current_fingerprint: str | None = None) -> dict:
         return {
             "report_id": report.id,
             "project_id": report.project_id,
@@ -419,6 +438,10 @@ class CalculationService:
             "lines": lines,
             "input_fingerprint": report.input_fingerprint,
             "result_fingerprint": report.result_fingerprint,
+            "current_revision_no": report.current_revision_no,
+            "current_result_fingerprint": current_fingerprint,
+            "revised": report.current_revision_no is not None
+            and report.current_revision_no > 1,
             "status": report.status.value,
             "created_by": report.created_by,
             "created_at": report.created_at,

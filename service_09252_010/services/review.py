@@ -33,7 +33,11 @@ class ReviewService:
                 raise StateError("报告已被驳回，为不可变终态")
 
             new_status = ReportStatus.REVIEWED if approve else ReportStatus.REJECTED
-            store.set_report_status(report_id, new_status)
+            if approve:
+                # 复核通过即首次签发：固化修订 v1 历史并置版本指针
+                store.mark_report_issued(report_id, self.clock.now())
+            else:
+                store.set_report_status(report_id, new_status)
             store.add_report_event(
                 report_id,
                 "reviewed" if approve else "rejected",
