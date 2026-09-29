@@ -155,6 +155,85 @@ class HttpApiTests(unittest.TestCase):
         }, {"X-Institution-Id": "陌生机构"})
         self.assertEqual(status, 403)
 
+    def test_signed_report_revision_flow(self) -> None:
+        # 指标 + 授权 + 数据 + 规则，走到已签发报告
+        call(self.app, "POST", "/indicators", {
+            "code": "enrollment_total", "name": "招生总数", "category": "招生",
+            "unit": "人", "formula": {"type": "sum",
+                                      "measure": "enrollment_count"},
+        }, SUP)
+        for permission in ("import", "calculate", "view", "export"):
+            call(self.app, "POST", "/grants", {
+                "institution_id": "机构A", "project_id": "P1",
+                "category": "*", "permission": permission,
+            }, SUP)
+        status, body = call(self.app, "POST", "/evidence", {
+            "project_id": "P1", "kind": "年报",
+            "uri": "s3://ev/2024.pdf", "sha256": "a" * 64,
+        }, INST_A)
+        evidence_id = body["evidence_id"]
+        call(self.app, "POST", "/projects/P1/imports", {
+            "records": [{"measure": "enrollment_count", "period": "2024-01",
+                         "caliber": "CN-STD", "value": 25,
+                         "evidence_id": evidence_id}],
+        }, INST_A)
+        status, task = call(self.app, "POST", "/tasks", {
+            "project_id": "P1", "window_start": "2024-01",
+            "window_end": "2024-01", "target_caliber": "CN-STD",
+            "idempotency_key": "rev-key",
+        }, INST_A)
+        status, run = call(self.app, "POST",
+                           f"/tasks/{task['task_id']}/run", {}, INST_A)
+        report_id = run["report_id"]
+        status, _ = call(self.app, "POST", f"/reports/{report_id}/review",
+                         {"approve": True}, SUP)
+        self.assertEqual(status, 200)
+
+        # 迟到数据形成新数据版本
+        call(self.app, "POST", "/projects/P1/imports", {
+            "records": [{"measure": "enrollment_count", "period": "2024-01",
+                         "caliber": "CN-STD", "value": 30,
+                         "evidence_id": evidence_id}],
+        }, INST_A)
+
+        # 更正申请（带版本校验）→ 签发新修订
+        status, proposal = call(
+            self.app, "POST", f"/reports/{report_id}/revisions",
+            {"correction_reason": "迟到数据补录", "expected_version": 0},
+            INST_A)
+        self.assertEqual(status, 201, proposal)
+        self.assertEqual(proposal["status"], "proposed")
+        status, issued = call(
+            self.app, "POST",
+            f"/reports/{report_id}/revisions/1/issue",
+            {"expected_version": 0}, SUP)
+        self.assertEqual(status, 200, issued)
+        self.assertEqual(issued["status"], "issued")
+
+        # 旧版读取：v0 仍是原签发内容，v1 是更正后内容
+        status, v0 = call(self.app, "GET",
+                          f"/reports/{report_id}/revisions/0", headers=SUP)
+        self.assertEqual(status, 200, v0)
+        self.assertEqual(v0["lines"][0]["value"], 25.0)
+        status, v1 = call(self.app, "GET",
+                          f"/reports/{report_id}/revisions/1", headers=SUP)
+        self.assertEqual(v1["lines"][0]["value"], 30.0)
+        self.assertEqual(v1["correction_reason"], "迟到数据补录")
+
+        # 签发历史：读者同时看到旧内容、新内容与更正理由
+        status, history = call(self.app, "GET",
+                               f"/reports/{report_id}/revisions", headers=SUP)
+        self.assertEqual(history["current_version"], 1)
+        self.assertEqual([h["version"] for h in history["history"]], [0, 1])
+
+        # 冲突响应：基于过期版本号修改已签版本 → 409
+        status, conflict = call(
+            self.app, "POST", f"/reports/{report_id}/revisions",
+            {"correction_reason": "基于旧版", "expected_version": 0}, INST_A)
+        self.assertEqual(status, 409, conflict)
+        self.assertEqual(conflict["error"], "conflict")
+        self.assertEqual(conflict["detail"]["current_version"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

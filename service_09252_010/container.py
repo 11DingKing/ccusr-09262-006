@@ -17,6 +17,7 @@ from .services.export import ExportService
 from .services.imports import ImportService
 from .services.indicators import IndicatorService
 from .services.review import ReviewService
+from .services.revisions import RevisionService
 
 
 class Container:
@@ -32,5 +33,7 @@ class Container:
         self.imports = ImportService(self.db, self.clock, self.ids)
         self.calibers = CaliberService(self.db, self.clock, self.ids)
         self.calculation = CalculationService(self.db, self.clock, self.ids)
-        self.review = ReviewService(self.db, self.clock)
+        self.review = ReviewService(self.db, self.clock, self.ids)
+        self.revisions = RevisionService(self.db, self.clock, self.ids,
+                                         self.calculation)
         self.exports = ExportService(self.db, self.clock, self.ids)

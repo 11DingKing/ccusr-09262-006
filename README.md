@@ -58,6 +58,10 @@
 | `GET  /reports/{report_id}` | 报告详情（pins、指纹、事件、证据引用） |
 | `POST /reports/{report_id}/reverify` | 按固化版本复算并核对指纹 |
 | `POST /reports/{report_id}/review` | 复核通过/驳回（复核人不得是原计算人） |
+| `POST /reports/{report_id}/revisions` | 已签报告更正申请（生成 proposed 新修订，带 `expected_version` 版本校验） |
+| `GET  /reports/{report_id}/revisions` | 签发历史：原始签发 v0 与全部修订（旧内容 + 更正理由） |
+| `POST /reports/{report_id}/revisions/{no}/issue` | 签发修订（新内容生效，旧版保留；带版本校验） |
+| `GET  /reports/{report_id}/revisions/{no}` | 读取指定签发版本（0 为原始签发，旧版始终可读） |
 | `POST /reports/{report_id}/exports` | 导出复核通过的报告（含换算依据与证据清单） |
 | `POST /grants` | 主管单位配置机构授权 |
 
@@ -83,7 +87,9 @@ python3 -m unittest discover -s tests -v
 覆盖场景：缺失值三种策略（skip/zero/fail）、跨年度观察期窗口、
 迟到数据新版本与差异、撤回记录、并发会签恰好生效一次、
 幂等提交与并发收敛、断点恢复与失败标记、指标更新不可改写旧报告、
-规则回滚仅影响新报告、授权粒度过滤、复核独立性与导出留痕、HTTP 全链路。
+规则回滚仅影响新报告、授权粒度过滤、复核独立性与导出留痕、HTTP 全链路、
+已签报告更正只新增修订（旧签发内容与更正理由同时留痕、旧版读取）、
+修订版本乐观校验冲突（409）。
 
 ## 编译检查
 

@@ -37,8 +37,15 @@ class TaskStatus(str, Enum):
 
 class ReportStatus(str, Enum):
     COMPUTED = "computed"  # 已计算，待复核
-    REVIEWED = "reviewed"  # 复核通过，可导出
+    REVIEWED = "reviewed"  # 复核通过，可导出（即“已签发”）
     REJECTED = "rejected"  # 复核驳回（终态）
+
+
+class RevisionStatus(str, Enum):
+    """已签报告修订申请的生命周期。"""
+
+    PROPOSED = "proposed"  # 更正申请中，尚未签发
+    ISSUED = "issued"  # 已签发为新修订，读者可见
 
 
 # 计算任务的断点步骤，顺序即执行顺序。
@@ -159,7 +166,11 @@ class ComputationTask:
 
 @dataclass(frozen=True)
 class Report:
-    """项目结论：pins 固化全部输入版本，fingerprint 支持复算核对。"""
+    """项目结论：pins 固化全部输入版本，fingerprint 支持复算核对。
+
+    revision_version 为当前签发修订号：0 为原始签发，>0 为更正后的新修订；
+    原始报告行永不改写，全部修订快照存于 report_revisions。
+    """
 
     id: str
     project_id: str
@@ -175,6 +186,31 @@ class Report:
     created_by: str
     created_at: str
     task_id: str
+    revision_version: int = 0
+
+
+@dataclass(frozen=True)
+class ReportRevision:
+    """已签报告的一次更正：保留新签发内容与更正理由，旧版内容不被覆盖。
+
+    revision_no 为 0 表示原始签发（在复核通过时快照），>=1 为更正修订。
+    """
+
+    id: str
+    report_id: str
+    revision_no: int
+    status: RevisionStatus
+    pins: dict
+    lines: list[dict]
+    data_version_no: int
+    input_fingerprint: str
+    result_fingerprint: str
+    correction_reason: str | None = None
+    requested_by: str | None = None
+    requested_at: str | None = None
+    issued_by: str | None = None
+    issued_at: str | None = None
+    base_version: int | None = None  # 申请时所基于的修订号（版本校验留痕）
 
 
 @dataclass(frozen=True)

@@ -121,8 +121,29 @@ CREATE TABLE IF NOT EXISTS reports (
     status TEXT NOT NULL,
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    task_id TEXT NOT NULL UNIQUE
+    task_id TEXT NOT NULL UNIQUE,
+    revision_version INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS report_revisions (
+    id TEXT PRIMARY KEY,
+    report_id TEXT NOT NULL REFERENCES reports(id),
+    revision_no INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    pins_json TEXT NOT NULL,
+    lines_json TEXT NOT NULL,
+    data_version_no INTEGER NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    result_fingerprint TEXT NOT NULL,
+    correction_reason TEXT,
+    requested_by TEXT,
+    requested_at TEXT,
+    issued_by TEXT,
+    issued_at TEXT,
+    base_version INTEGER,
+    UNIQUE (report_id, revision_no)
+);
+CREATE INDEX IF NOT EXISTS idx_report_revisions_report
+    ON report_revisions (report_id, revision_no);
 CREATE TABLE IF NOT EXISTS report_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     report_id TEXT NOT NULL REFERENCES reports(id),
@@ -159,6 +180,12 @@ def connect(path: str) -> sqlite3.Connection:
     if path != ":memory:":
         conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA)
+    # 轻量迁移：旧库 reports 表补修订版本列
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(reports)")}
+    if "revision_version" not in cols:
+        conn.execute(
+            "ALTER TABLE reports ADD COLUMN revision_version INTEGER NOT NULL DEFAULT 0"
+        )
     return conn
 
 

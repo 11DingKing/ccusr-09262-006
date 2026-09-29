@@ -13,7 +13,9 @@ from ..domain.models import (
     IndicatorVersion,
     Observation,
     Report,
+    ReportRevision,
     ReportStatus,
+    RevisionStatus,
     RuleStatus,
     TaskStatus,
     ComputationTask,
@@ -358,13 +360,15 @@ class Store:
             "INSERT INTO reports (id, project_id, window_start, window_end,"
             " target_caliber, data_version_no, pins_json, lines_json,"
             " input_fingerprint, result_fingerprint, status, created_by,"
-            " created_at, task_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " created_at, task_id, revision_version)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (report.id, report.project_id, report.window_start, report.window_end,
              report.target_caliber, report.data_version_no,
              json.dumps(report.pins, sort_keys=True),
              json.dumps(report.lines, sort_keys=True),
              report.input_fingerprint, report.result_fingerprint,
-             report.status.value, report.created_by, report.created_at, report.task_id),
+             report.status.value, report.created_by, report.created_at,
+             report.task_id, report.revision_version),
         )
 
     def get_report(self, report_id: str) -> Report | None:
@@ -386,6 +390,18 @@ class Store:
             (status.value, report_id),
         )
 
+    def apply_revision(self, report_id: str, revision: ReportRevision) -> None:
+        """把已签发修订的内容提升为报告当前内容（原始内容仍可经修订历史追溯）。"""
+        self.conn.execute(
+            "UPDATE reports SET pins_json = ?, lines_json = ?,"
+            " data_version_no = ?, input_fingerprint = ?,"
+            " result_fingerprint = ?, revision_version = ? WHERE id = ?",
+            (json.dumps(revision.pins, sort_keys=True),
+             json.dumps(revision.lines, sort_keys=True),
+             revision.data_version_no, revision.input_fingerprint,
+             revision.result_fingerprint, revision.revision_no, report_id),
+        )
+
     @staticmethod
     def _to_report(row: sqlite3.Row) -> Report:
         return Report(
@@ -403,6 +419,68 @@ class Store:
             created_by=row["created_by"],
             created_at=row["created_at"],
             task_id=row["task_id"],
+            revision_version=row["revision_version"],
+        )
+
+    # ---- 已签报告修订（更正申请与新修订签发）----
+    def add_revision(self, revision: ReportRevision) -> None:
+        self.conn.execute(
+            "INSERT INTO report_revisions (id, report_id, revision_no, status,"
+            " pins_json, lines_json, data_version_no, input_fingerprint,"
+            " result_fingerprint, correction_reason, requested_by,"
+            " requested_at, issued_by, issued_at, base_version)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (revision.id, revision.report_id, revision.revision_no,
+             revision.status.value, json.dumps(revision.pins, sort_keys=True),
+             json.dumps(revision.lines, sort_keys=True),
+             revision.data_version_no, revision.input_fingerprint,
+             revision.result_fingerprint, revision.correction_reason,
+             revision.requested_by, revision.requested_at,
+             revision.issued_by, revision.issued_at, revision.base_version),
+        )
+
+    def get_revision(self, report_id: str, revision_no: int) -> ReportRevision | None:
+        row = self.conn.execute(
+            "SELECT * FROM report_revisions"
+            " WHERE report_id = ? AND revision_no = ?",
+            (report_id, revision_no),
+        ).fetchone()
+        return self._to_revision(row) if row else None
+
+    def list_revisions(self, report_id: str) -> list[ReportRevision]:
+        rows = self.conn.execute(
+            "SELECT * FROM report_revisions WHERE report_id = ?"
+            " ORDER BY revision_no",
+            (report_id,),
+        ).fetchall()
+        return [self._to_revision(r) for r in rows]
+
+    def mark_revision_issued(self, revision_id: str, issued_by: str,
+                             issued_at: str) -> None:
+        self.conn.execute(
+            "UPDATE report_revisions SET status = ?,"
+            " issued_by = ?, issued_at = ? WHERE id = ?",
+            (RevisionStatus.ISSUED.value, issued_by, issued_at, revision_id),
+        )
+
+    @staticmethod
+    def _to_revision(row: sqlite3.Row) -> ReportRevision:
+        return ReportRevision(
+            id=row["id"],
+            report_id=row["report_id"],
+            revision_no=row["revision_no"],
+            status=RevisionStatus(row["status"]),
+            pins=json.loads(row["pins_json"]),
+            lines=json.loads(row["lines_json"]),
+            data_version_no=row["data_version_no"],
+            input_fingerprint=row["input_fingerprint"],
+            result_fingerprint=row["result_fingerprint"],
+            correction_reason=row["correction_reason"],
+            requested_by=row["requested_by"],
+            requested_at=row["requested_at"],
+            issued_by=row["issued_by"],
+            issued_at=row["issued_at"],
+            base_version=row["base_version"],
         )
 
     def add_report_event(self, report_id: str, event: str, actor: str,

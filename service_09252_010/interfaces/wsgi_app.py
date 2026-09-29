@@ -75,6 +75,14 @@ class Application:
             ("POST", ("reports", "{report_id}", "review"), self._review_report),
             ("POST", ("reports", "{report_id}", "reverify"), self._reverify),
             ("POST", ("reports", "{report_id}", "exports"), self._export_report),
+            ("POST", ("reports", "{report_id}", "revisions"),
+             self._request_revision),
+            ("GET", ("reports", "{report_id}", "revisions"),
+             self._list_revisions),
+            ("POST", ("reports", "{report_id}", "revisions", "{no}", "issue"),
+             self._issue_revision),
+            ("GET", ("reports", "{report_id}", "revisions", "{no}"),
+             self._get_revision),
             ("GET", ("reports", "{report_id}"), self._get_report),
             ("POST", ("grants",), self._create_grant),
         ]
@@ -272,6 +280,41 @@ class Application:
 
     def _export_report(self, p: Principal, body: dict, ctx: Context):
         return 200, ctx.container.exports.export(p, ctx.match["report_id"])
+
+    # ---- 已签报告修订 ----
+    def _request_revision(self, p: Principal, body: dict, ctx: Context):
+        from ..domain.errors import ValidationError
+
+        reason = body.get("correction_reason") or body.get("reason") or ""
+        expected = body.get("expected_version")
+        if expected is not None and not isinstance(expected, int):
+            raise ValidationError("expected_version 必须为整数")
+        result = ctx.container.revisions.request_revision(
+            p, ctx.match["report_id"], reason=reason,
+            expected_version=expected, pins=body.get("pins"),
+        )
+        return 201, result
+
+    def _issue_revision(self, p: Principal, body: dict, ctx: Context):
+        from ..domain.errors import ValidationError
+
+        expected = body.get("expected_version")
+        if expected is not None and not isinstance(expected, int):
+            raise ValidationError("expected_version 必须为整数")
+        return 200, ctx.container.revisions.issue_revision(
+            p, ctx.match["report_id"], int(ctx.match["no"]),
+            expected_version=expected,
+        )
+
+    def _list_revisions(self, p: Principal, body: dict, ctx: Context):
+        return 200, ctx.container.revisions.list_revisions(
+            p, ctx.match["report_id"]
+        )
+
+    def _get_revision(self, p: Principal, body: dict, ctx: Context):
+        return 200, ctx.container.revisions.get_version(
+            p, ctx.match["report_id"], int(ctx.match["no"])
+        )
 
     # ---- 授权管理 ----
     def _create_grant(self, p: Principal, body: dict, ctx: Context):

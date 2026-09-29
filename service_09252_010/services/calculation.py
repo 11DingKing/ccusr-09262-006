@@ -255,9 +255,37 @@ class CalculationService:
         conv = checkpoints[STEP_CONVERT]
         periods = iter_periods(task.window_start, task.window_end)
 
+        values, evidence_by_measure = self._merge_converted(conv["rows"])
+        lines, indicator_pins = self._build_lines(
+            store, values, evidence_by_measure, periods, None
+        )
+
+        pins = {
+            "data_version": snap["data_version_no"],
+            "indicators": indicator_pins,
+            "rules": conv["rules_used"],
+        }
+        input_payload = {
+            "project_id": task.project_id,
+            "window": [task.window_start, task.window_end],
+            "target_caliber": task.target_caliber,
+            "pins": pins,
+            "snapshot": snap["rows"],
+        }
+        return {
+            "lines": lines,
+            "pins": pins,
+            "input_fingerprint": fingerprint(input_payload),
+        }
+
+    @staticmethod
+    def _merge_converted(rows: list[dict]) -> tuple[
+        dict[str, dict[str, float | None]], dict[str, set[str]]
+    ]:
+        """合并各口径换算结果：缺失值不覆盖实值，冲突实值直接报错。"""
         values: dict[str, dict[str, float | None]] = {}
         evidence_by_measure: dict[str, set[str]] = {}
-        for r in conv["rows"]:
+        for r in rows:
             slot = values.setdefault(r["measure"], {})
             existing = slot.get(r["period"], _ABSENT)
             if existing is _ABSENT or existing is None:
@@ -274,12 +302,35 @@ class CalculationService:
                 evidence_by_measure.setdefault(r["measure"], set()).add(
                     r["evidence_id"]
                 )
+        return values, evidence_by_measure
 
+    @staticmethod
+    def _build_lines(store: Store,
+                     values: dict[str, dict[str, float | None]],
+                     evidence_by_measure: dict[str, set[str]],
+                     periods: list[str],
+                     pinned_indicators: dict[str, int] | None
+                     ) -> tuple[list[dict], dict[str, int]]:
+        """按指标版本（None 表示取最新）求值并装配报告行。"""
         lines: list[dict] = []
         indicator_pins: dict[str, int] = {}
         for indicator in store.list_indicators():
-            version = store.latest_indicator_version(indicator.code)
-            assert version is not None
+            if pinned_indicators is not None \
+                    and indicator.code not in pinned_indicators:
+                # 按固化版本重算：报告之后新登记的指标不属于该报告
+                continue
+            if pinned_indicators is not None:
+                version = store.get_indicator_version(
+                    indicator.code, pinned_indicators[indicator.code]
+                )
+                if version is None:
+                    raise StateError(
+                        f"重算失败：指标 {indicator.code}"
+                        f" v{pinned_indicators[indicator.code]} 已不存在"
+                    )
+            else:
+                version = store.latest_indicator_version(indicator.code)
+                assert version is not None
             validate_formula(version.formula)
             needed = formula_measures(version.formula)
             scoped = {m: values.get(m, {}) for m in needed}
@@ -301,23 +352,95 @@ class CalculationService:
                 "notes": list(result.notes),
                 "evidence_ids": evidence_ids,
             })
+        return lines, indicator_pins
 
-        pins = {
-            "data_version": snap["data_version_no"],
+    def recompute(self, store: Store, *, project_id: str, window_start: str,
+                  window_end: str, target_caliber: str,
+                  pins: dict | None = None) -> dict:
+        """只读重算：pins 给定时严格按固化版本取数，否则取当前最新版本。
+
+        已签报告更正据此生成新修订内容；不依赖任何任务断点。
+        返回 lines/pins/数据版本与输入、结果指纹。
+        """
+        periods = iter_periods(window_start, window_end)
+        lo, hi = period_key(window_start), period_key(window_end)
+        if pins is not None:
+            seq = pins["data_version"]
+        else:
+            seq = store.latest_batch_seq(project_id)
+            if seq is None:
+                raise ValidationError("项目尚无任何数据版本，无法计算")
+
+        rows: list[SnapshotRow] = []
+        for obs in store.snapshot(project_id, seq):
+            if obs.retracted or not (lo <= period_key(obs.period) <= hi):
+                continue
+            rows.append(SnapshotRow(
+                measure=obs.measure, period=obs.period, caliber=obs.caliber,
+                value=obs.value, evidence_id=obs.evidence_id,
+            ))
+
+        rules_used: dict[str, int] = {}
+        if pins is not None:
+            rules_params: dict[str, tuple[float, float]] = {}
+            for key, ver in pins["rules"].items():
+                r = store.get_rule_by_version(key, ver)
+                if r is None:
+                    raise StateError(f"重算失败：规则 {key} v{ver} 已不存在")
+                rules_params[key] = (r.factor, r.offset)
+            rules_used = dict(pins["rules"])
+        else:
+            active = {r.rule_key: r for r in store.active_rules()}
+            rules_params = {key: (r.factor, r.offset)
+                            for key, r in active.items()}
+            for original in rows:
+                if original.caliber == target_caliber:
+                    continue
+                key = rule_key(original.measure, original.caliber,
+                               target_caliber)
+                if key in active:
+                    rules_used[key] = active[key].version_no
+        converted, missing_keys = convert_rows(
+            rows, rules_params, target_caliber
+        )
+        if missing_keys:
+            raise ValidationError(
+                "缺少口径换算规则，无法生成更正内容",
+                detail={"missing_rules": sorted(missing_keys)},
+            )
+
+        values, evidence_by_measure = self._merge_converted([
+            {"measure": r.measure, "period": r.period, "caliber": r.caliber,
+             "value": r.value, "evidence_id": r.evidence_id}
+            for r in converted
+        ])
+        pinned_indicators = pins["indicators"] if pins is not None else None
+        lines, indicator_pins = self._build_lines(
+            store, values, evidence_by_measure, periods, pinned_indicators
+        )
+        new_pins = {
+            "data_version": seq,
             "indicators": indicator_pins,
-            "rules": conv["rules_used"],
+            "rules": rules_used,
         }
         input_payload = {
-            "project_id": task.project_id,
-            "window": [task.window_start, task.window_end],
-            "target_caliber": task.target_caliber,
-            "pins": pins,
-            "snapshot": snap["rows"],
+            "project_id": project_id,
+            "window": [window_start, window_end],
+            "target_caliber": target_caliber,
+            "pins": new_pins,
+            "snapshot": [
+                {"measure": r.measure, "period": r.period,
+                 "caliber": r.caliber, "value": r.value,
+                 "evidence_id": r.evidence_id}
+                for r in rows
+            ],
         }
         return {
+            "data_version_no": seq,
+            "pins": new_pins,
             "lines": lines,
-            "pins": pins,
             "input_fingerprint": fingerprint(input_payload),
+            "result_fingerprint": fingerprint(lines),
         }
 
     def _persist_report(self, store: Store, task: ComputationTask,
@@ -415,6 +538,7 @@ class CalculationService:
             "window": [report.window_start, report.window_end],
             "target_caliber": report.target_caliber,
             "data_version_no": report.data_version_no,
+            "revision_version": report.revision_version,
             "pins": report.pins,
             "lines": lines,
             "input_fingerprint": report.input_fingerprint,
@@ -430,6 +554,7 @@ class CalculationService:
         """按报告固化的版本（指标/规则/数据）复算，核对结果指纹。
 
         指标定义更新、规则回滚或迟到数据均不影响复算——全部输入按 pins 取版本。
+        复算与更正共用同一套重算逻辑，保证修订后的报告同样可核对。
         """
         with self.db.read() as conn:
             store = Store(conn)
@@ -437,69 +562,18 @@ class CalculationService:
             if report is None:
                 raise NotFoundError(f"报告不存在: {report_id}")
             AccessPolicy(store).require(principal, report.project_id, "*", "view")
-            periods = iter_periods(report.window_start, report.window_end)
-            lo, hi = period_key(report.window_start), period_key(report.window_end)
-
-            rows: list[SnapshotRow] = []
-            for obs in store.snapshot(report.project_id, report.data_version_no):
-                if obs.retracted or not (lo <= period_key(obs.period) <= hi):
-                    continue
-                rows.append(SnapshotRow(
-                    measure=obs.measure, period=obs.period, caliber=obs.caliber,
-                    value=obs.value, evidence_id=obs.evidence_id,
-                ))
-            rules_params: dict[str, tuple[float, float]] = {}
-            for key, ver in report.pins["rules"].items():
-                r = store.get_rule_by_version(key, ver)
-                if r is None:
-                    raise StateError(f"复算失败：规则 {key} v{ver} 已不存在")
-                rules_params[key] = (r.factor, r.offset)
-            converted, missing = convert_rows(
-                rows, rules_params, report.target_caliber
+            recomputed = self.recompute(
+                store, project_id=report.project_id,
+                window_start=report.window_start, window_end=report.window_end,
+                target_caliber=report.target_caliber, pins=report.pins,
             )
-            if missing:
-                raise StateError(f"复算失败：缺少固化规则 {missing}")
-
-            values: dict[str, dict[str, float | None]] = {}
-            for r in converted:
-                values.setdefault(r.measure, {})[r.period] = r.value
-
-            lines: list[dict] = []
-            for line in report.lines:
-                version = store.get_indicator_version(
-                    line["code"], report.pins["indicators"][line["code"]]
-                )
-                if version is None:
-                    raise StateError(
-                        f"复算失败：指标 {line['code']} v{line['version_no']} 已不存在"
-                    )
-                needed = formula_measures(version.formula)
-                scoped = {m: values.get(m, {}) for m in needed}
-                result = evaluate(version.formula, version.missing_policy,
-                                  periods, scoped)
-                lines.append({**line,
-                              "value": result.value,
-                              "covered_periods": list(result.covered_periods),
-                              "missing_periods": list(result.missing_periods),
-                              "notes": list(result.notes)})
-            input_payload = {
-                "project_id": report.project_id,
-                "window": [report.window_start, report.window_end],
-                "target_caliber": report.target_caliber,
-                "pins": report.pins,
-                "snapshot": [
-                    {"measure": r.measure, "period": r.period,
-                     "caliber": r.caliber, "value": r.value,
-                     "evidence_id": r.evidence_id}
-                    for r in rows
-                ],
-            }
-            input_fp = fingerprint(input_payload)
-            result_fp = fingerprint(lines)
         return {
             "report_id": report_id,
-            "input_match": input_fp == report.input_fingerprint,
-            "result_match": result_fp == report.result_fingerprint,
+            "input_match":
+                recomputed["input_fingerprint"] == report.input_fingerprint,
+            "result_match":
+                recomputed["result_fingerprint"] == report.result_fingerprint,
             "stored_result_fingerprint": report.result_fingerprint,
-            "recomputed_result_fingerprint": result_fp,
+            "recomputed_result_fingerprint":
+                recomputed["result_fingerprint"],
         }
